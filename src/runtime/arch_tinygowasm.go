@@ -67,7 +67,7 @@ func growHeap() bool {
 // the wasi-libc dlmalloc heap implementation instead. If they are needed by any
 // program, they can certainly be implemented.
 
-//export malloc
+//zexport malloc
 func libc_malloc(size uintptr) unsafe.Pointer {
 	return alloc(size, nil)
 }
@@ -77,7 +77,7 @@ func libc_free(ptr unsafe.Pointer) {
 	free(ptr)
 }
 
-//export calloc
+//zexport calloc
 func libc_calloc(nmemb, size uintptr) unsafe.Pointer {
 	// Note: we could be even more correct here and check that nmemb * size
 	// doesn't overflow. However the current implementation should normally work
@@ -85,7 +85,7 @@ func libc_calloc(nmemb, size uintptr) unsafe.Pointer {
 	return alloc(nmemb*size, nil)
 }
 
-//export realloc
+//zexport realloc
 func libc_realloc(ptr unsafe.Pointer, size uintptr) unsafe.Pointer {
 	return realloc(ptr, size)
 }
