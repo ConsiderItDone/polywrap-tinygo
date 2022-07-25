@@ -11,6 +11,7 @@ import (
 	"math/bits"
 	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"github.com/tinygo-org/tinygo/compiler/llvmutil"
 	"github.com/tinygo-org/tinygo/loader"
 	"golang.org/x/tools/go/ssa"
+	"golang.org/x/tools/go/types/typeutil"
 	"tinygo.org/x/go-llvm"
 )
 
@@ -70,7 +72,7 @@ type compilerContext struct {
 	cu               llvm.Metadata
 	difiles          map[string]llvm.Metadata
 	ditypes          map[types.Type]llvm.Metadata
-	llvmTypes        map[types.Type]llvm.Type
+	llvmTypes        typeutil.Map
 	machine          llvm.TargetMachine
 	targetData       llvm.TargetData
 	intType          llvm.Type
@@ -87,6 +89,12 @@ type compilerContext struct {
 	runtimePkg       *types.Package
 }
 
+// Regular expression for detecting generic functions and setting `linkonce_odr`.
+var (
+	mapPattern   = regexp.MustCompile(`(?m)map\[[^\]]+\]`)
+	genericsTest = regexp.MustCompile(`(?m)\[[^\]]+\]`)
+)
+
 // newCompilerContext returns a new compiler context ready for use, most
 // importantly with a newly created LLVM context and module.
 func newCompilerContext(moduleName string, machine llvm.TargetMachine, config *Config, dumpSSA bool) *compilerContext {
@@ -95,7 +103,6 @@ func newCompilerContext(moduleName string, machine llvm.TargetMachine, config *C
 		DumpSSA:     dumpSSA,
 		difiles:     make(map[string]llvm.Metadata),
 		ditypes:     make(map[types.Type]llvm.Metadata),
-		llvmTypes:   make(map[types.Type]llvm.Type),
 		machine:     machine,
 		targetData:  machine.CreateTargetData(),
 		astComments: map[string]*ast.CommentGroup{},
@@ -329,12 +336,16 @@ func (c *compilerContext) getLLVMRuntimeType(name string) llvm.Type {
 // important for named struct types (which should only be created once).
 func (c *compilerContext) getLLVMType(goType types.Type) llvm.Type {
 	// Try to load the LLVM type from the cache.
-	if t, ok := c.llvmTypes[goType]; ok {
-		return t
+	// Note: *types.Named isn't unique when working with generics.
+	// See https://github.com/golang/go/issues/53914
+	// This is the reason for using typeutil.Map to lookup LLVM types for Go types.
+	ival := c.llvmTypes.At(goType)
+	if ival != nil {
+		return ival.(llvm.Type)
 	}
 	// Not already created, so adding this type to the cache.
 	llvmType := c.makeLLVMType(goType)
-	c.llvmTypes[goType] = llvmType
+	c.llvmTypes.Set(goType, llvmType)
 	return llvmType
 }
 
@@ -391,7 +402,7 @@ func (c *compilerContext) makeLLVMType(goType types.Type) llvm.Type {
 			// self-referencing types such as linked lists.
 			llvmName := typ.Obj().Pkg().Path() + "." + typ.Obj().Name()
 			llvmType := c.ctx.StructCreateNamed(llvmName)
-			c.llvmTypes[goType] = llvmType // avoid infinite recursion
+			c.llvmTypes.Set(goType, llvmType) // avoid infinite recursion
 			underlying := c.getLLVMType(st)
 			llvmType.StructSetBody(underlying.StructElementTypes(), false)
 			return llvmType
@@ -1031,6 +1042,13 @@ func (b *builder) createFunctionStart() {
 		b.addError(b.fn.Pos(), errValue)
 		return
 	}
+	// Set linkage to `linkonce_odr` for generic functions.
+	name := b.llvmFn.Name()
+	// Remove instances of map[???] before looking for generic brackets.
+	name = mapPattern.ReplaceAllString(name, "")
+	if genericsTest.MatchString(name) {
+		b.llvmFn.SetLinkage(llvm.LinkOnceODRLinkage)
+	}
 	b.addStandardDefinedAttributes(b.llvmFn)
 	if !b.info.exported {
 		b.llvmFn.SetVisibility(llvm.HiddenVisibility)
@@ -1541,6 +1559,12 @@ func (b *builder) createBuiltin(argTypes []types.Type, argValues []llvm.Value, c
 			case *types.Pointer:
 				ptrValue := b.CreatePtrToInt(value, b.uintptrType, "")
 				b.createRuntimeCall("printptr", []llvm.Value{ptrValue}, "")
+			case *types.Slice:
+				bufptr := b.CreateExtractValue(value, 0, "")
+				buflen := b.CreateExtractValue(value, 1, "")
+				bufcap := b.CreateExtractValue(value, 2, "")
+				ptrValue := b.CreatePtrToInt(bufptr, b.uintptrType, "")
+				b.createRuntimeCall("printslice", []llvm.Value{ptrValue, buflen, bufcap}, "")
 			default:
 				return llvm.Value{}, b.makeError(pos, "unknown arg type: "+typ.String())
 			}
